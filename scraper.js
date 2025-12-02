@@ -7,31 +7,13 @@ const FIREBASE_SECRET = 'JbXhB8D2qIXuQyRoNZIArvX9Q6vqUGA7HunILgBl'; // <--- CHAV
 const DATABASE_URL = 'https://arc-radar-default-rtdb.firebaseio.com/events.json';
 const REFRESH_INTERVAL_MINUTES = 60; // Check hourly (App handles interpolation)
 const TARGET_URL = 'https://metaforge.app/arc-raiders/event-timers';
-const TIME_API_URL = 'http://worldtimeapi.org/api/timezone/America/Sao_Paulo';
 
 const KNOWN_MAPS = ['Buried City', 'Dam Battlegrounds', 'Dam', 'The Spaceport', 'Spaceport', 'Blue Gate', 'Stella Montis'];
 const KNOWN_EVENTS = ['Night Raid', 'Electromagnetic Storm', 'Matriarch', 'Harvester', 'Hidden Bunker', 'Husk Graveyard', 'Prospecting Probes', 'Uncovered Caches', 'Standard Patrol', 'Lush Blooms', 'Inquisitor'];
 
-// GLOBAL OFFSET (Difference between Atomic Time and Local PC Time)
+// GLOBAL OFFSET 
+// No Railway/Cloud, o relógio é sincronizado via NTP. Não precisamos de API externa.
 let CLOCK_OFFSET = 0;
-
-async function syncClock() {
-    try {
-        console.log('[CLOCK] Sincronizando com Relógio Atômico...');
-        const response = await axios.get(TIME_API_URL, { timeout: 5000 });
-        const atomicTime = new Date(response.data.datetime).getTime();
-        const localTime = Date.now();
-        
-        CLOCK_OFFSET = atomicTime - localTime;
-        
-        console.log(`[CLOCK] Ajuste de Tempo: ${Math.round(CLOCK_OFFSET/1000)}s`);
-        const correctedTime = new Date(localTime + CLOCK_OFFSET);
-        console.log(`[CLOCK] Hora PC: ${new Date(localTime).toLocaleTimeString()} -> Hora Real (BRT): ${correctedTime.toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo' })}`);
-    } catch (e) {
-        console.error('[CLOCK] Falha ao sincronizar. Usando hora local.', e.message);
-        CLOCK_OFFSET = 0;
-    }
-}
 
 function getRealNow() {
     return Date.now() + CLOCK_OFFSET;
@@ -69,7 +51,6 @@ function parseTimeWindowToTimestamp(windowStr, type) {
         if (targetTs < now - (12 * 3600 * 1000)) {
             targetTs += 24 * 3600 * 1000; // Add 24h
         }
-        // If type is START and it looks like it's in the past but shouldn't be (not strictly needed for windows logic but good safety)
         
         return targetTs;
 
@@ -80,9 +61,8 @@ function parseTimeWindowToTimestamp(windowStr, type) {
 }
 
 async function scrapeAndSave() {
-    await syncClock(); 
-
-    console.log(`\n[ARC RADAR] --- Iniciando Scanner: ${new Date(getRealNow()).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo' })} ---`);
+    // Clock Sync removido: Servidores cloud (Railway) já possuem hora correta.
+    console.log(`\n[ARC RADAR] --- Iniciando Scanner: ${new Date().toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo' })} (Server Time) ---`);
     
     // Check key format
     const cleanSecret = FIREBASE_SECRET.trim();
@@ -98,10 +78,8 @@ async function scrapeAndSave() {
     
     try {
         const page = await browser.newPage();
-        // Viewport large enough to load all cards without scrolling issues
         await page.setViewport({ width: 1440, height: 2500 });
         
-        // Set User Agent
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
 
         console.log(`[ARC RADAR] Acessando MetaForge...`);
@@ -115,12 +93,11 @@ async function scrapeAndSave() {
             const results = [];
             const divs = Array.from(document.querySelectorAll('div'));
             
-            // Find event cards by looking for container divs that have "Upcoming windows" text
             const eventCards = divs.filter(div => {
                 const text = div.innerText || "";
                 return knownEvents.some(e => text.includes(e)) && 
                        text.toLowerCase().includes('upcoming windows') &&
-                       text.length < 3000; // Limit length to avoid grabbing the whole body
+                       text.length < 3000; 
             });
 
             const processedTexts = new Set();
@@ -128,28 +105,21 @@ async function scrapeAndSave() {
             eventCards.forEach(card => {
                 const fullText = card.innerText;
                 
-                // Deduplicate: inner divs might be caught, check if we already processed this text block
                 if (processedTexts.has(fullText)) return;
                 processedTexts.add(fullText);
 
-                // --- HEADER PARSING ---
-                // We split by "Upcoming windows" to isolate the header
                 const parts = fullText.split(/Upcoming windows/i);
                 if (parts.length < 2) return;
 
                 const headerSection = parts[0];
                 const tableText = parts[1];
 
-                // Identify Event Type
                 const headerUpper = headerSection.toUpperCase();
                 const eventType = knownEvents.find(e => headerUpper.includes(e.toUpperCase())) || "Unknown";
 
-                // Extract Window (e.g. 10:00 - 11:00) from header
-                // This is crucial for precise timing
                 const windowMatch = headerSection.match(/(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})/);
                 const windowStr = windowMatch ? windowMatch[0] : null;
 
-                // Fallback Duration (parsed from "Ends in Xm")
                 let headerDurationSeconds = 3600; 
                 const durationMatch = headerSection.match(/(?:ENDS|STARTS) IN(.*?)(?:\n|$)/i);
                 if (durationMatch && durationMatch[1]) {
@@ -164,7 +134,6 @@ async function scrapeAndSave() {
                      if (sec > 0) headerDurationSeconds = sec;
                 }
 
-                // --- TABLE PARSING ---
                 const lines = tableText.split('\n');
                 let currentMap = null;
 
@@ -172,17 +141,14 @@ async function scrapeAndSave() {
                     const line = lines[i].trim();
                     if (!line) continue;
 
-                    // Check if line contains a Map Name
                     const foundMap = knownMaps.find(m => line.toUpperCase().includes(m.toUpperCase()));
                     if (foundMap) currentMap = foundMap;
 
                     if (currentMap) {
                         let status = null;
-                        // "Now" indicates Active
                         if (line.toLowerCase().includes('now')) {
                             status = 'ACTIVE';
                         } 
-                        // "in Xh" indicates Upcoming
                         else if (line.toLowerCase().includes('in ')) {
                             status = 'UPCOMING';
                         }
@@ -192,9 +158,9 @@ async function scrapeAndSave() {
                                 mapName: currentMap,
                                 eventType: eventType,
                                 status: status,
-                                windowStr: windowStr, // Use the header's window for the active event
+                                windowStr: windowStr, 
                                 fallbackDuration: headerDurationSeconds,
-                                rowText: line // Save text to parse relative time for upcoming
+                                rowText: line 
                             });
                         }
                     }
@@ -206,28 +172,23 @@ async function scrapeAndSave() {
 
         console.log(`[ARC RADAR] ${scrapedData.length} eventos brutos encontrados.`);
 
-        // ENRICHMENT & TIME CALCULATION
         const enrichedEvents = scrapedData.map((evt, index) => {
             let targetTimestamp = null;
             const now = getRealNow(); 
 
             if (evt.status === 'ACTIVE') {
-                // For Active events, we trust the "Window" string (e.g. 11:00 - 12:00) 
-                // found in the header to determine the End Time.
                 if (evt.windowStr) {
                     targetTimestamp = parseTimeWindowToTimestamp(evt.windowStr, 'END');
                 }
-                // Fallback if regex failed
                 if (!targetTimestamp) {
                     targetTimestamp = now + (evt.fallbackDuration * 1000);
                 }
             } 
             else if (evt.status === 'UPCOMING') {
-                // For Upcoming, we read the "in 5h 30m" text from the table row
                 let rowSeconds = 0;
                 const matchesH = evt.rowText.match(/(\d+)\s*[hH]/);
                 const matchesM = evt.rowText.match(/(\d+)\s*[mM]/);
-                const matchesS = evt.rowText.match(/(\d+)\s*[sS]/); // Rare for upcoming but possible
+                const matchesS = evt.rowText.match(/(\d+)\s*[sS]/); 
                 if (matchesH) rowSeconds += parseInt(matchesH[1]) * 3600;
                 if (matchesM) rowSeconds += parseInt(matchesM[1]) * 60;
                 if (matchesS) rowSeconds += parseInt(matchesS[1]);
@@ -235,12 +196,10 @@ async function scrapeAndSave() {
                 if (rowSeconds > 0) {
                     targetTimestamp = now + (rowSeconds * 1000);
                 } else {
-                     // Safety fallback
                      targetTimestamp = now + 3600000; 
                 }
             }
 
-            // Create Unique ID
             const uniqueKey = `${evt.eventType}-${evt.mapName}-${evt.status}-${targetTimestamp}`;
 
             return {
@@ -255,8 +214,6 @@ async function scrapeAndSave() {
             };
         });
 
-        // DEDUPLICATION
-        // Sometimes nested divs cause duplicates. We key by map+event+status.
         const uniqueEvents = [];
         const seenKeys = new Set();
         enrichedEvents.forEach(e => {
@@ -269,9 +226,9 @@ async function scrapeAndSave() {
         if (uniqueEvents.length > 0) {
             console.log(`[ARC RADAR] Enviando dados para o Firebase...`);
             
-            // Build URL manually for legacy secret auth
+            // AUTH LEGACY: Usando concatenação direta na URL (método mais robusto para Secrets antigos)
+            // Isso evita problemas de formatação com 'axios params'
             const finalUrl = `${DATABASE_URL}?auth=${cleanSecret}`;
-            // console.log(`[DEBUG] URL Destino: ${finalUrl.replace(cleanSecret, '***HIDDEN***')}`);
             
             await axios.put(finalUrl, uniqueEvents, {
                 headers: {
@@ -285,11 +242,9 @@ async function scrapeAndSave() {
 
     } catch (error) {
         if (error.response) {
-            // Erro vindo do Firebase (401, 403, etc)
             console.error(`[ARC RADAR] Erro Firebase: ${error.response.status} ${error.response.statusText}`);
             console.error(`[ARC RADAR] Detalhes:`, JSON.stringify(error.response.data));
         } else {
-            // Erro de rede ou puppeteer
             console.error('[ARC RADAR] Erro Fatal:', error.message);
         }
     } finally {
