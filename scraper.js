@@ -3,7 +3,7 @@ const puppeteer = require('puppeteer');
 const axios = require('axios');
 
 // CONFIG
-const FIREBASE_SECRET = 'JbXhB8D2qIXuQyRoNZIArvX9Q6vqUGA7HunILgBl'; // <--- CHAVE CORRIGIDA
+const FIREBASE_SECRET = 'JbXhB8D2qIXuQyRoNZIArvX9Q6vqUGA7HunILgBl'; 
 const DATABASE_URL = 'https://arc-radar-default-rtdb.firebaseio.com/events.json';
 const REFRESH_INTERVAL_MINUTES = 60; // Check hourly (App handles interpolation)
 const TARGET_URL = 'https://metaforge.app/arc-raiders/event-timers';
@@ -12,14 +12,13 @@ const KNOWN_MAPS = ['Buried City', 'Dam Battlegrounds', 'Dam', 'The Spaceport', 
 const KNOWN_EVENTS = ['Night Raid', 'Electromagnetic Storm', 'Matriarch', 'Harvester', 'Hidden Bunker', 'Husk Graveyard', 'Prospecting Probes', 'Uncovered Caches', 'Standard Patrol', 'Lush Blooms', 'Inquisitor'];
 
 // GLOBAL OFFSET 
-// No Railway/Cloud, o relógio é sincronizado via NTP. Não precisamos de API externa.
 let CLOCK_OFFSET = 0;
 
 function getRealNow() {
     return Date.now() + CLOCK_OFFSET;
 }
 
-// Parses "11:00 - 12:00" into an absolute Timestamp, ignoring OS Timezone
+// Parses "11:00 - 12:00" into an absolute Timestamp (FALLBACK ONLY)
 function parseTimeWindowToTimestamp(windowStr, type) {
     try {
         if (!windowStr || !windowStr.includes('-')) return null;
@@ -30,26 +29,17 @@ function parseTimeWindowToTimestamp(windowStr, type) {
 
         const now = getRealNow();
         
-        // 1. Get current YYYY-MM-DD in Sao Paulo explicitly
-        const fmt = new Intl.DateTimeFormat('en-CA', { // en-CA returns YYYY-MM-DD format
-            timeZone: 'America/Sao_Paulo',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit'
-        });
-        const ymd = fmt.format(new Date(now)); // e.g. "2023-10-27"
-
-        // 2. Construct ISO String with fixed -03:00 offset for Sao Paulo
-        // This bypasses the Windows System Timezone completely
-        const isoString = `${ymd}T${h.padStart(2,'0')}:${m.padStart(2,'0')}:00-03:00`;
+        // Default to local server time construction to avoid offset math errors
+        const d = new Date(now);
+        d.setHours(parseInt(h), parseInt(m), 0, 0);
         
-        let targetTs = new Date(isoString).getTime();
+        let targetTs = d.getTime();
 
-        // 3. Handle Day Rollover
-        // If target time (e.g. 00:10) is much smaller than now (e.g. 23:50), it means it's tomorrow
-        // Threshold: 12 hours ago
+        // Handle Day Rollover (If target is in the past, maybe it's tomorrow, or if it's way in future, maybe it was yesterday)
+        // Simple logic: if target is more than 12h away from now, adjust.
+        // But since we prioritize "ENDS IN", this is rarely used.
         if (targetTs < now - (12 * 3600 * 1000)) {
-            targetTs += 24 * 3600 * 1000; // Add 24h
+            targetTs += 24 * 3600 * 1000; 
         }
         
         return targetTs;
@@ -61,8 +51,7 @@ function parseTimeWindowToTimestamp(windowStr, type) {
 }
 
 async function scrapeAndSave() {
-    // Clock Sync removido: Servidores cloud (Railway) já possuem hora correta.
-    console.log(`\n[ARC RADAR] --- Iniciando Scanner: ${new Date().toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo' })} (Server Time) ---`);
+    console.log(`\n[ARC RADAR] --- Iniciando Scanner: ${new Date().toLocaleTimeString('pt-BR')} (Server Time) ---`);
     
     // Check key format
     const cleanSecret = FIREBASE_SECRET.trim();
@@ -120,7 +109,8 @@ async function scrapeAndSave() {
                 const windowMatch = headerSection.match(/(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})/);
                 const windowStr = windowMatch ? windowMatch[0] : null;
 
-                let headerDurationSeconds = 3600; 
+                // CRITICAL: Extract "ENDS IN" or "STARTS IN" duration precisely
+                let headerDurationSeconds = 0; 
                 const durationMatch = headerSection.match(/(?:ENDS|STARTS) IN(.*?)(?:\n|$)/i);
                 if (durationMatch && durationMatch[1]) {
                      const timeStr = durationMatch[1];
@@ -131,7 +121,7 @@ async function scrapeAndSave() {
                      if (h) sec += parseInt(h[1]) * 3600;
                      if (m) sec += parseInt(m[1]) * 60;
                      if (s) sec += parseInt(s[1]);
-                     if (sec > 0) headerDurationSeconds = sec;
+                     headerDurationSeconds = sec;
                 }
 
                 const lines = tableText.split('\n');
@@ -153,13 +143,23 @@ async function scrapeAndSave() {
                             status = 'UPCOMING';
                         }
 
+                        // Try to get specific row duration if available
+                        let rowSeconds = 0;
+                        const matchesH = line.match(/(\d+)\s*[hH]/);
+                        const matchesM = line.match(/(\d+)\s*[mM]/);
+                        const matchesS = line.match(/(\d+)\s*[sS]/); 
+                        if (matchesH) rowSeconds += parseInt(matchesH[1]) * 3600;
+                        if (matchesM) rowSeconds += parseInt(matchesM[1]) * 60;
+                        if (matchesS) rowSeconds += parseInt(matchesS[1]);
+
                         if (status) {
                             results.push({
                                 mapName: currentMap,
                                 eventType: eventType,
                                 status: status,
                                 windowStr: windowStr, 
-                                fallbackDuration: headerDurationSeconds,
+                                headerDuration: headerDurationSeconds,
+                                rowDuration: rowSeconds,
                                 rowText: line 
                             });
                         }
@@ -176,26 +176,34 @@ async function scrapeAndSave() {
             let targetTimestamp = null;
             const now = getRealNow(); 
 
+            // LOGIC CORRECTION: Priority to relative duration (ENDS IN / STARTS IN)
+            // This avoids Timezone Offset errors completely.
+
             if (evt.status === 'ACTIVE') {
-                if (evt.windowStr) {
+                // If it's active, we want to know when it ENDS.
+                // Priority 1: Use header duration "ENDS IN 58m"
+                if (evt.headerDuration > 0) {
+                    targetTimestamp = now + (evt.headerDuration * 1000);
+                } 
+                // Priority 2: Use window string parsing (Risky due to timezone)
+                else if (evt.windowStr) {
                     targetTimestamp = parseTimeWindowToTimestamp(evt.windowStr, 'END');
                 }
-                if (!targetTimestamp) {
-                    targetTimestamp = now + (evt.fallbackDuration * 1000);
+                // Fallback: 1 hour from now
+                else {
+                    targetTimestamp = now + 3600000;
                 }
             } 
             else if (evt.status === 'UPCOMING') {
-                let rowSeconds = 0;
-                const matchesH = evt.rowText.match(/(\d+)\s*[hH]/);
-                const matchesM = evt.rowText.match(/(\d+)\s*[mM]/);
-                const matchesS = evt.rowText.match(/(\d+)\s*[sS]/); 
-                if (matchesH) rowSeconds += parseInt(matchesH[1]) * 3600;
-                if (matchesM) rowSeconds += parseInt(matchesM[1]) * 60;
-                if (matchesS) rowSeconds += parseInt(matchesS[1]);
-
-                if (rowSeconds > 0) {
-                    targetTimestamp = now + (rowSeconds * 1000);
-                } else {
+                // Priority 1: Row duration "Starts in 2h"
+                if (evt.rowDuration > 0) {
+                    targetTimestamp = now + (evt.rowDuration * 1000);
+                }
+                // Priority 2: Header duration "Starts in ..." (Less precise for specific maps)
+                else if (evt.headerDuration > 0) {
+                    targetTimestamp = now + (evt.headerDuration * 1000);
+                }
+                else {
                      targetTimestamp = now + 3600000; 
                 }
             }
@@ -217,8 +225,10 @@ async function scrapeAndSave() {
         const uniqueEvents = [];
         const seenKeys = new Set();
         enrichedEvents.forEach(e => {
-             if (!seenKeys.has(e._key)) {
-                 seenKeys.add(e._key);
+             // Basic dedupe
+             const simpleKey = e.mapName + e.eventType + e.status;
+             if (!seenKeys.has(simpleKey)) {
+                 seenKeys.add(simpleKey);
                  uniqueEvents.push(e);
              }
         });
@@ -226,14 +236,11 @@ async function scrapeAndSave() {
         if (uniqueEvents.length > 0) {
             console.log(`[ARC RADAR] Enviando dados para o Firebase...`);
             
-            // AUTH LEGACY: Usando concatenação direta na URL (método mais robusto para Secrets antigos)
-            // Isso evita problemas de formatação com 'axios params'
+            // AUTH LEGACY via URL string
             const finalUrl = `${DATABASE_URL}?auth=${cleanSecret}`;
             
             await axios.put(finalUrl, uniqueEvents, {
-                headers: {
-                    'Content-Type': 'application/json'
-                }
+                headers: { 'Content-Type': 'application/json' }
             });
             console.log(`[ARC RADAR] Sucesso! ${uniqueEvents.length} eventos sincronizados.`);
         } else {
