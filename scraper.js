@@ -5,11 +5,13 @@ const axios = require('axios');
 // CONFIG
 const FIREBASE_SECRET = 'JbXhB8D2qIXuQyRoNZIArvX9Q6vqUGA7HunILgBl'; 
 const DATABASE_URL = 'https://arc-radar-default-rtdb.firebaseio.com/events.json';
-const REFRESH_INTERVAL_MINUTES = 60; 
+const REFRESH_INTERVAL_MINUTES = 180; // Alterado para 3 horas (180m) conforme solicitado
 const TARGET_URL = 'https://metaforge.app/arc-raiders/event-timers';
 
-const KNOWN_MAPS = ['Buried City', 'Dam Battlegrounds', 'Dam', 'The Spaceport', 'Spaceport', 'Blue Gate', 'Stella Montis'];
-const KNOWN_EVENTS = ['Night Raid', 'Electromagnetic Storm', 'Matriarch', 'Harvester', 'Hidden Bunker', 'Husk Graveyard', 'Prospecting Probes', 'Uncovered Caches', 'Standard Patrol', 'Lush Blooms', 'Inquisitor'];
+const KNOWN_MAPS = [
+    'Buried City', 'Dam Battlegrounds', 'Dam', 'The Spaceport', 'Spaceport', 
+    'Blue Gate', 'Stella Montis'
+];
 
 // Use System Time (Server is usually NTP synced)
 function getRealNow() {
@@ -43,107 +45,111 @@ async function scrapeAndSave() {
         await new Promise(r => setTimeout(r, 5000));
 
         // SCRAPING LOGIC
-        const scrapedData = await page.evaluate((knownMaps, knownEvents) => {
+        const scrapedData = await page.evaluate((knownMaps) => {
             const results = [];
             const divs = Array.from(document.querySelectorAll('div'));
             
-            // Find cards containing "Upcoming windows"
+            // LOGIC UPDATE: Instead of looking for specific text headers like "Upcoming windows" which might change,
+            // we look for ANY container that mentions "Ends in" or "Starts in" AND contains a known Map name.
+            // This is much more robust against layout changes.
+            
             const eventCards = divs.filter(div => {
                 const text = div.innerText || "";
-                return knownEvents.some(e => text.includes(e)) && 
-                       text.toLowerCase().includes('upcoming windows') &&
-                       text.length < 3000; 
+                if (text.length > 2000) return false; // Ignore large containers
+                if (text.length < 50) return false;   // Ignore tiny labels
+
+                const hasTimer = /Ends\s+in|Starts\s+in|Ends:|Starts:/i.test(text);
+                const hasMap = knownMaps.some(m => text.toUpperCase().includes(m.toUpperCase()));
+                
+                return hasTimer && hasMap;
             });
 
-            const processedTexts = new Set();
+            // Use Set to avoid processing the same card multiple times (since divs are nested)
+            const processedSignatures = new Set();
 
             eventCards.forEach(card => {
                 const fullText = card.innerText;
-                if (processedTexts.has(fullText)) return;
-                processedTexts.add(fullText);
+                
+                // Simple signature based on first 50 chars to dedup nested divs
+                const signature = fullText.substring(0, 50);
+                if (processedSignatures.has(signature)) return;
+                processedSignatures.add(signature);
 
-                // Split Header from Table
-                const parts = fullText.split(/Upcoming windows/i);
-                if (parts.length < 2) return;
+                // Split Header from Table (Heuristic: usually split by the timer or a new line)
+                const lines = fullText.split('\n').map(l => l.trim()).filter(l => l);
+                
+                // Try to detect Event Name (usually first line that isn't a timer)
+                let detectedName = "Unknown Event";
+                for (const line of lines) {
+                    if (!line.match(/Ends\s+in/i) && !line.match(/Starts\s+in/i) && !line.match(/^\d+/) && line.length > 3) {
+                        detectedName = line;
+                        break;
+                    }
+                }
+                detectedName = detectedName.replace(/[:]/g, '').trim();
 
-                const headerSection = parts[0];
-                const tableText = parts[1];
-
-                // Identify Event Type
-                const headerUpper = headerSection.toUpperCase();
-                const eventType = knownEvents.find(e => headerUpper.includes(e.toUpperCase())) || "Unknown";
-
-                // Extract Window String just for display (don't use for math)
-                const windowMatch = headerSection.match(/(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})/);
+                // Extract Window String
+                const windowMatch = fullText.match(/(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})/);
                 const windowStr = windowMatch ? windowMatch[0] : null;
 
-                // --- CRITICAL: Relative Time Extraction ---
-                // Looks for "ENDS IN 58m", "STARTS IN 2h 10m", "Ends in: 5m"
+                // Extract Timer Seconds
                 let headerDurationSeconds = 0; 
-                // Regex: Matches "ENDS" or "STARTS", optional "IN", optional colon, capturing the time string
-                const durationMatch = headerSection.match(/(?:ENDS|STARTS)(?:\s+IN)?\s*:?\s*(.*?)(?:\n|$)/i);
+                const durationMatch = fullText.match(/(?:ENDS|STARTS|Ends|Starts)(?:\s+IN|:)?\s*:?\s*(.*?)(?:\n|$)/i);
                 
                 if (durationMatch && durationMatch[1]) {
                      const timeStr = durationMatch[1].toLowerCase();
                      let sec = 0;
-                     
-                     // Robust parsing for "1h 20m", "58m", "30s"
                      const h = timeStr.match(/(\d+)\s*h/);
                      const m = timeStr.match(/(\d+)\s*m/);
                      const s = timeStr.match(/(\d+)\s*s/);
-                     
                      if (h) sec += parseInt(h[1]) * 3600;
                      if (m) sec += parseInt(m[1]) * 60;
                      if (s) sec += parseInt(s[1]);
-                     
                      headerDurationSeconds = sec;
                 }
 
-                // Process Table Rows (Specific Maps)
-                const lines = tableText.split('\n');
+                // Identify Map and Status
                 let currentMap = null;
+                let status = null;
 
-                for (let i = 0; i < lines.length; i++) {
-                    const line = lines[i].trim();
-                    if (!line) continue;
-
+                // Loop through lines to find specific map status
+                for (const line of lines) {
                     const foundMap = knownMaps.find(m => line.toUpperCase().includes(m.toUpperCase()));
                     if (foundMap) currentMap = foundMap;
 
                     if (currentMap) {
-                        let status = null;
-                        if (line.toLowerCase().includes('now') || line.toLowerCase().includes('active')) {
-                            status = 'ACTIVE';
-                        } 
-                        else if (line.toLowerCase().includes('in ')) {
-                            status = 'UPCOMING';
-                        }
+                         if (line.match(/Active|Now|Live/i)) status = 'ACTIVE';
+                         else if (line.match(/in\s+\d+|Upcoming/i)) status = 'UPCOMING';
+                         
+                         // If we found a map line, and we have a global timer from the header, we can form an event
+                         if (status) {
+                             // Try to find specific row timer if available, else use header timer
+                             let rowSeconds = headerDurationSeconds;
+                             const rowH = line.match(/(\d+)\s*[hH]/);
+                             const rowM = line.match(/(\d+)\s*[mM]/);
+                             if (rowH || rowM) {
+                                 rowSeconds = 0;
+                                 if (rowH) rowSeconds += parseInt(rowH[1]) * 3600;
+                                 if (rowM) rowSeconds += parseInt(rowM[1]) * 60;
+                             }
 
-                        // Try to get specific row duration
-                        let rowSeconds = 0;
-                        const matchesH = line.match(/(\d+)\s*[hH]/);
-                        const matchesM = line.match(/(\d+)\s*[mM]/);
-                        const matchesS = line.match(/(\d+)\s*[sS]/); 
-                        if (matchesH) rowSeconds += parseInt(matchesH[1]) * 3600;
-                        if (matchesM) rowSeconds += parseInt(matchesM[1]) * 60;
-                        if (matchesS) rowSeconds += parseInt(matchesS[1]);
-
-                        if (status) {
-                            results.push({
+                             results.push({
                                 mapName: currentMap,
-                                eventType: eventType,
+                                eventType: detectedName,
                                 status: status,
                                 windowStr: windowStr, 
-                                headerDuration: headerDurationSeconds,
-                                rowDuration: rowSeconds
+                                duration: rowSeconds
                             });
-                        }
+                            // Reset for next iteration in same card
+                            currentMap = null; 
+                            status = null;
+                         }
                     }
                 }
             });
 
             return results;
-        }, KNOWN_MAPS, KNOWN_EVENTS);
+        }, KNOWN_MAPS);
 
         console.log(`[ARC RADAR] ${scrapedData.length} eventos brutos encontrados.`);
 
@@ -152,38 +158,22 @@ async function scrapeAndSave() {
             let targetTimestamp = null;
             let finalWindowStr = evt.windowStr;
 
-            // --- UNIVERSAL TIME CALCULATION ---
-            // Logic: "Target Time" = "Server Now" + "Remaining Duration"
-            // This creates a UTC Timestamp that is true everywhere.
-
             if (evt.status === 'ACTIVE') {
-                // If Active, Target = When it ENDS
-                if (evt.headerDuration > 0) {
-                    targetTimestamp = now + (evt.headerDuration * 1000);
+                if (evt.duration > 0) {
+                    targetTimestamp = now + (evt.duration * 1000);
                 } else {
-                    // Fallback if regex fails: 1 hour default
                     targetTimestamp = now + 3600000;
                     if (!finalWindowStr) finalWindowStr = "LIVE NOW";
                 }
             } 
             else if (evt.status === 'UPCOMING') {
-                // If Upcoming, Target = When it STARTS
-                
-                // Row duration is usually more specific for "Upcoming" list items
-                if (evt.rowDuration > 0) {
-                    targetTimestamp = now + (evt.rowDuration * 1000);
-                }
-                // Fallback to header if row fails
-                else if (evt.headerDuration > 0) {
-                    targetTimestamp = now + (evt.headerDuration * 1000);
-                }
-                else {
-                     // Fallback: 1 hour default
+                if (evt.duration > 0) {
+                    targetTimestamp = now + (evt.duration * 1000);
+                } else {
                      targetTimestamp = now + 3600000; 
                 }
             }
 
-            // Create a unique key for Firebase to avoid duplicates/flicker
             const uniqueKey = `${evt.eventType}-${evt.mapName}-${evt.status}-${targetTimestamp}`.replace(/[.#$/\[\]]/g, '');
 
             return {
@@ -194,12 +184,11 @@ async function scrapeAndSave() {
                 targetTimestamp: targetTimestamp,
                 windowStr: finalWindowStr, 
                 scrapedAt: now,
-                // Debug info
                 durationSeconds: Math.floor((targetTimestamp - now) / 1000)
             };
         });
 
-        // Deduplicate events (sometimes scraping picks up duplicates)
+        // Deduplicate events
         const uniqueEvents = [];
         const seenKeys = new Set();
         enrichedEvents.forEach(e => {
@@ -212,10 +201,7 @@ async function scrapeAndSave() {
 
         if (uniqueEvents.length > 0) {
             console.log(`[ARC RADAR] Enviando dados para o Firebase...`);
-            
-            // Legacy Auth via URL string
             const finalUrl = `${DATABASE_URL}?auth=${cleanSecret}`;
-            
             await axios.put(finalUrl, uniqueEvents, {
                 headers: { 'Content-Type': 'application/json' }
             });
@@ -227,7 +213,6 @@ async function scrapeAndSave() {
     } catch (error) {
         if (error.response) {
             console.error(`[ARC RADAR] Erro Firebase: ${error.response.status} ${error.response.statusText}`);
-            console.error(`[ARC RADAR] Detalhes:`, JSON.stringify(error.response.data));
         } else {
             console.error('[ARC RADAR] Erro Fatal:', error.message);
         }
